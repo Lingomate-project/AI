@@ -1,11 +1,4 @@
-"""stt.py
-Batch STT (English-only) using Google Cloud Speech **v2**.
-
-Return:
-  (transcript, alt_segments)
-    - transcript: top-1 후보들을 이어 붙인 최종 문자열
-    - alt_segments: 각 세그먼트의 N-best 후보 문자열 리스트들
-"""
+#stt.py
 
 from __future__ import annotations
 
@@ -17,51 +10,67 @@ import numpy as np
 from google.cloud import speech_v2 as speech
 from google.oauth2 import service_account
 import google.auth
+from google.api_core.client_options import ClientOptions
+
 
 # =========================
-# Fixed policy & tunables
+# 고정 정책 & 튜닝 값
 # =========================
-STT_PRIMARY: str = "en-US"   # 영어만 인식 (원하면 "en-US"로 A/B 테스트)
-SAMPLE_RATE: int = 16000
-N_BEST: int = 8
-RECOGNIZER_LOCATION: str = "global"
+STT_PRIMARY: str = "en-US"              # 인식 언어(영어 고정)
+SAMPLE_RATE: int = 48000                # 입력 PCM 샘플레이트(Hz)
+N_BEST: int = 8                         # 세그먼트별 대안 후보 개수
 
-# 가벼운 전처리(원치 않으면 coeff=0.0, target=None)
-PREEMPHASIS: float = 0.97         # 0 = off, 0.95~0.98 권장
-TARGET_RMS_DBFS: float | None = -20  # 레벨이 너무 작/큰 경우만 ±12 dB 내에서 보정
+RECOGNIZER_LOCATION: str = "asia-northeast1"
 
-# Windows event loop policy (sounddevice 대비)
+# 사용할 STT 모델 ID
+STT_MODEL: str = "chirp_3"
+
+# 가벼운 전처리
+PREEMPHASIS: float = 0.97               # 프리엠퍼시스 계수
+TARGET_RMS_DBFS: float | None = -18     # 대략적 RMS 타깃(dBFS)
+
+# Windows 에서 sounddevice 사용 시 이벤트 루프 정책 설정
 if sys.platform.startswith("win"):
     import asyncio as _asyncio
     _asyncio.set_event_loop_policy(_asyncio.WindowsSelectorEventLoopPolicy())
 
 
 # =========================
-# Utilities
+# 유틸리티
 # =========================
 def log(title: str) -> None:
+    """콘솔에 구분선과 함께 타이틀 로그 출력."""
     line = "=" * len(title)
     print(f"\n{line}\n{title}\n{line}")
 
 
 def _load_speech_client() -> speech.SpeechClient:
-    """Prefer GOOGLE_APPLICATION_CREDENTIALS (service account); else ADC."""
     cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+
+    client_options = None
+    location = RECOGNIZER_LOCATION
+    # global 이 아닌 경우 리전 엔드포인트로 접속
+    if location and location != "global":
+        client_options = ClientOptions(api_endpoint=f"{location}-speech.googleapis.com")
+
     if cred_path and os.path.exists(cred_path):
         creds = service_account.Credentials.from_service_account_file(cred_path)
-        return speech.SpeechClient(credentials=creds)
-    return speech.SpeechClient()
+        return speech.SpeechClient(credentials=creds, client_options=client_options)
+
+    # ADC 사용
+    return speech.SpeechClient(client_options=client_options)
 
 
 def _project_id_from_adc() -> str:
+    """ADC에서 현재 GCP 프로젝트 ID를 해석. 실패 시 예외 발생."""
     project_id = google.auth.default()[1]
     if not project_id:
-        raise RuntimeError("Failed to resolve GCP project id from ADC/credentials.")
+        raise RuntimeError("ADC/자격증명에서 GCP 프로젝트 ID를 찾지 못했습니다.")
     return project_id
 
 
 # =========================
-# Audio pre-processing
+# 오디오 전처리
 # =========================
 def _preemphasis(x: np.ndarray, coeff: float) -> np.ndarray:
     if not (0.0 < coeff < 1.0):
@@ -99,8 +108,9 @@ def _preprocess_pcm(pcm: bytes) -> bytes:
 
 
 # =========================
-# v2 Recognize config
+# v2 Recognize 구성 (Chirp 3)
 # =========================
+
 def _build_recognize_config(sr: int) -> speech.RecognitionConfig:
     decoding = speech.ExplicitDecodingConfig(
         encoding=speech.ExplicitDecodingConfig.AudioEncoding.LINEAR16,
@@ -109,50 +119,37 @@ def _build_recognize_config(sr: int) -> speech.RecognitionConfig:
     )
     features = speech.RecognitionFeatures(
         enable_automatic_punctuation=True,
-        max_alternatives=N_BEST,
+        max_alternatives=N_BEST
     )
     return speech.RecognitionConfig(
         explicit_decoding_config=decoding,
-        language_codes=[STT_PRIMARY],
-        model="latest_short",  # 길게 말하면 "latest_long"으로 바꿔서 A/B
+        language_codes=[STT_PRIMARY], 
+        model=STT_MODEL,
         features=features,
     )
 
 
-# =========================
-# Public API
-# =========================
 async def stt_transcribe(pcm: bytes, sr: int = SAMPLE_RATE) -> Tuple[str, List[List[str]]]:
-    """
-    Batch recognize in **English only** (v2 Recognize API).
-    Args:
-        pcm: raw PCM16 mono audio bytes.
-        sr : sample rate (Hz), 실제 오디오와 일치해야 함.
-
-    Returns:
-        transcript: str
-        alt_segments: List[List[str]] — 각 세그먼트의 N-best 후보.
-    """
-    log(f"STT via Google Cloud Speech-to-Text v2 (batch recognize, language={STT_PRIMARY})")
+    log(f"STT (v2 Recognize + {STT_MODEL}) 실행 — language={STT_PRIMARY}, location={RECOGNIZER_LOCATION}")
 
     def _do_recognize() -> Tuple[str, List[List[str]]]:
         client = _load_speech_client()
         project_id = _project_id_from_adc()
         recognizer = f"projects/{project_id}/locations/{RECOGNIZER_LOCATION}/recognizers/_"
 
-        # 전처리
+        # 1) 전처리 적용
         pcm_clean = _preprocess_pcm(pcm)
 
-        # Recognize 요청
+        # 2) Recognize 요청 구성 & 호출
         config = _build_recognize_config(sr)
         request = speech.RecognizeRequest(
             recognizer=recognizer,
             config=config,
-            content=pcm_clean,   # v2는 별도 RecognitionAudio 없이 content 필드에 직접 바이트 전달
+            content=pcm_clean,  # v2는 별도 RecognitionAudio 없이 content에 직접 바이트 전달
         )
         response = client.recognize(request=request)
 
-        # 결과 파싱
+        # 3) 결과 파싱
         alt_segments: List[List[str]] = []
         top_pieces: List[str] = []
         for result in response.results:
@@ -165,7 +162,6 @@ async def stt_transcribe(pcm: bytes, sr: int = SAMPLE_RATE) -> Tuple[str, List[L
             top_pieces.append(alts[0])
 
         transcript = " ".join(p for p in top_pieces if p).strip()
-        print(f"→ TRANSCRIPT(top-1): {transcript or '[EMPTY]'}")
         return transcript, alt_segments
 
     import asyncio
