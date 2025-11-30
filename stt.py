@@ -1,17 +1,18 @@
-#stt.py
-
+# stt.py
 from __future__ import annotations
 
 import os
 import sys
 from typing import List, Tuple
 
+import logging
 import numpy as np
 from google.cloud import speech_v2 as speech
 from google.oauth2 import service_account
 import google.auth
 from google.api_core.client_options import ClientOptions
 
+logger = logging.getLogger(__name__)
 
 # =========================
 # 고정 정책 & 튜닝 값
@@ -21,6 +22,7 @@ SAMPLE_RATE: int = 48000                # 입력 PCM 샘플레이트(Hz)
 N_BEST: int = 8                         # 세그먼트별 대안 후보 개수
 
 RECOGNIZER_LOCATION: str = "asia-northeast1"
+RECOGNIZER_ID: str = os.getenv("STT_RECOGNIZER_ID", "_")
 
 # 사용할 STT 모델 ID
 STT_MODEL: str = "chirp_3"
@@ -41,7 +43,11 @@ if sys.platform.startswith("win"):
 def log(title: str) -> None:
     """콘솔에 구분선과 함께 타이틀 로그 출력."""
     line = "=" * len(title)
-    print(f"\n{line}\n{title}\n{line}")
+    logger.info("\n%s\n%s\n%s", line, title, line)
+
+
+def _build_recognizer_path(project_id: str) -> str:
+    return f"projects/{project_id}/locations/{RECOGNIZER_LOCATION}/recognizers/{RECOGNIZER_ID}"
 
 
 def _load_speech_client() -> speech.SpeechClient:
@@ -55,9 +61,11 @@ def _load_speech_client() -> speech.SpeechClient:
 
     if cred_path and os.path.exists(cred_path):
         creds = service_account.Credentials.from_service_account_file(cred_path)
+        logger.info("STT using explicit service account credentials")
         return speech.SpeechClient(credentials=creds, client_options=client_options)
 
     # ADC 사용
+    logger.info("STT using ADC (Application Default Credentials)")
     return speech.SpeechClient(client_options=client_options)
 
 
@@ -123,7 +131,7 @@ def _build_recognize_config(sr: int) -> speech.RecognitionConfig:
     )
     return speech.RecognitionConfig(
         explicit_decoding_config=decoding,
-        language_codes=[STT_PRIMARY], 
+        language_codes=[STT_PRIMARY],
         model=STT_MODEL,
         features=features,
     )
@@ -133,36 +141,43 @@ async def stt_transcribe(pcm: bytes, sr: int = SAMPLE_RATE) -> Tuple[str, List[L
     log(f"STT (v2 Recognize + {STT_MODEL}) 실행 — language={STT_PRIMARY}, location={RECOGNIZER_LOCATION}")
 
     def _do_recognize() -> Tuple[str, List[List[str]]]:
-        client = _load_speech_client()
-        project_id = _project_id_from_adc()
-        recognizer = f"projects/{project_id}/locations/{RECOGNIZER_LOCATION}/recognizers/_"
+        try:
+            client = _load_speech_client()
+            project_id = _project_id_from_adc()
+            recognizer = _build_recognizer_path(project_id)
+            logger.info("Using recognizer: %s", recognizer)
 
-        # 1) 전처리 적용
-        pcm_clean = _preprocess_pcm(pcm)
+            # 1) 전처리 적용
+            pcm_clean = _preprocess_pcm(pcm)
 
-        # 2) Recognize 요청 구성 & 호출
-        config = _build_recognize_config(sr)
-        request = speech.RecognizeRequest(
-            recognizer=recognizer,
-            config=config,
-            content=pcm_clean,  # v2는 별도 RecognitionAudio 없이 content에 직접 바이트 전달
-        )
-        response = client.recognize(request=request)
+            # 2) Recognize 요청 구성 & 호출
+            config = _build_recognize_config(sr)
+            request = speech.RecognizeRequest(
+                recognizer=recognizer,
+                config=config,
+                content=pcm_clean,  # v2는 별도 RecognitionAudio 없이 content에 직접 바이트 전달
+            )
+            response = client.recognize(request=request)
 
-        # 3) 결과 파싱
-        alt_segments: List[List[str]] = []
-        top_pieces: List[str] = []
-        for result in response.results:
-            if not result.alternatives:
-                continue
-            alts = [a.transcript.strip() for a in result.alternatives if a.transcript]
-            if not alts:
-                continue
-            alt_segments.append(alts)
-            top_pieces.append(alts[0])
+            # 3) 결과 파싱
+            alt_segments: List[List[str]] = []
+            top_pieces: List[str] = []
+            for result in response.results:
+                if not result.alternatives:
+                    continue
+                alts = [a.transcript.strip() for a in result.alternatives if a.transcript]
+                if not alts:
+                    continue
+                alt_segments.append(alts)
+                top_pieces.append(alts[0])
 
-        transcript = " ".join(p for p in top_pieces if p).strip()
-        return transcript, alt_segments
+            transcript = " ".join(p for p in top_pieces if p).strip()
+            logger.info("STT transcript: %s", transcript)
+            return transcript, alt_segments
+        except Exception as e:
+            logger.error("STT recognize error: %s", e, exc_info=True)
+            # 실패 시 빈 결과 반환
+            return "", []
 
     import asyncio
     return await asyncio.to_thread(_do_recognize)
