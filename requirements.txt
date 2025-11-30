@@ -15,3 +15,4 @@ google-api-core
 # --- Audio / Numeric ---
 numpy
 sounddevice
+pydantic
