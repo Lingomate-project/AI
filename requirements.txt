@@ -1,0 +1,17 @@
+# --- Web server ---
+fastapi
+uvicorn[standard]
+python-dotenv
+
+# --- Google LLM (Gemini) ---
+google-generativeai
+
+# --- Google Cloud STT/TTS ---
+google-cloud-speech
+google-cloud-texttospeech
+google-auth
+google-api-core
+
+# --- Audio / Numeric ---
+numpy
+sounddevice
