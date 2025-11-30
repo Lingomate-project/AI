@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────
 app = FastAPI(
     title="English Conversation Coach AI Server",
-    version="1.3.0",
+    version="1.0.0",
 )
 
 # 필요시 CORS 허용 (프론트/백엔드에서 호출할 수 있도록)
@@ -536,3 +536,4 @@ async def get_conversation_history(userId: Optional[str] = Query(default=None)):
             "history": history,
         },
     )
+
