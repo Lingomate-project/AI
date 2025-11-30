@@ -12,7 +12,11 @@ from typing import Final, Tuple, Optional
 
 import logging
 import numpy as np
-import sounddevice as sd
+try:
+    import sounddevice as sd
+except Exception:
+    sd = None
+    logger.warning("sounddevice import failed; local audio playback will be disabled.")
 from google.cloud import texttospeech as tts
 
 logger = logging.getLogger(__name__)
@@ -45,6 +49,10 @@ def _timestamp() -> str:
 
 
 def _play_pcm16(pcm: bytes, sr: int) -> None:
+    if sd is None:
+        logger.info("sounddevice is not available; skip local playback.")
+        return
+
     try:
         sd.play(np.frombuffer(pcm, dtype=np.int16), samplerate=sr)
         sd.wait()
@@ -194,3 +202,4 @@ def synthesize_wav_bytes(
         wf.writeframes(pcm)
 
     return buf.getvalue()
+
