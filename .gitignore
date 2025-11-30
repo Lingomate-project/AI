@@ -1,0 +1,5 @@
+# 환경 변수
+.env
+
+# Google service account
+*.json
