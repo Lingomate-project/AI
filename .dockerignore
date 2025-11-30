@@ -1,0 +1,11 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+gcp-sa-key.json
+.vscode/
+.idea/
+.DS_Store
