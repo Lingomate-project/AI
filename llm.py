@@ -259,55 +259,105 @@ def generate_example_reply(
 
 
 # =========================
-# 5. 사전 엔트리(단어/숙어 설명) LLM
+# 5. 세션 복습용 LLM (어려운 표현 정리)
 # =========================
 
-DICTIONARY_SYSTEM_PROMPT = (
-    "당신은 영어-한국어 이중언어 사전 도우미입니다.\n"
-    "하나의 영어 단어 또는 숙어(phrase)를 입력으로 받으면,\n"
-    "1) 그 의미를 한국어로 1~2문장으로 간단히 설명하고,\n"
-    "2) 그 단어/숙어를 실제로 사용하는 자연스러운 영어 예문을 정확히 2개 만들어 주세요.\n"
+SESSION_REVIEW_SYSTEM_PROMPT = (
+    "당신은 영어 회화 수업의 복습 노트를 정리하는 튜터입니다.\n"
+    "입력으로 한 세션 동안의 전체 대화 기록(chat_history)이 주어집니다.\n"
+    "chat_history의 각 항목은 대략 다음과 같은 형태입니다:\n"
+    "  {\"user\": \"...\", \"corrected_en\": \"...\", \"reply_en\": \"...\"}\n"
     "\n"
-    "응답은 반드시 JSON 형식 문자열로만 반환해야 합니다.\n"
-    '형식: {\"term\": \"...\", \"meaning_ko\": \"...\", \"examples\": [\"...\", \"...\"]}\n'
+    "당신의 역할은 다음과 같습니다:\n"
+    "1) reply_en(튜터의 영어 응답들)을 모두 살펴보고,\n"
+    "   한국인 학습자에게 '어려울 수 있지만 유용한' 단어 또는 숙어를 골라 주세요.\n"
+    "   - 예: 고급 어휘, 유용한 표현, 자주 쓰이는 구동사/관용구 등\n"
+    "2) 그런 표현들을 최대 5개까지 선택해서, 각각에 대해\n"
+    "   - term: 표현 원문 (단어 또는 숙어)\n"
+    "   - meaning_ko: 한국어 뜻/설명 (1~2문장)\n"
+    "   - examples: 해당 표현을 사용하는 자연스러운 영어 예문 2개\n"
+    "\n"
+    "응답 형식은 반드시 JSON 문자열만 허용되며, 정확히 다음과 같습니다:\n"
+    "{\n"
+    "  \"items\": [\n"
+    "    {\n"
+    "      \"term\": \"...\",\n"
+    "      \"meaning_ko\": \"...\",\n"
+    "      \"examples\": [\"...\", \"...\"]\n"
+    "    },\n"
+    "    ...\n"
+    "  ]\n"
+    "}\n"
+    "마크다운, 설명 문구 등은 절대 추가하지 마세요.\n"
 )
 
 
-def generate_dictionary_entry(term: str) -> Dict[str, Any]:
+def generate_session_review_vocab(
+    chat_history: List[Dict[str, str]],
+    max_items: int = 5,
+) -> Dict[str, Any]:
     """
-    /api/ai/dictionary 에서 사용하는 LLM 래퍼.
-    반환 형태:
-      { "term": str, "meaning_ko": str, "examples": List[str 길이=2] }
+    한 세션의 전체 대화 히스토리를 입력받아
+    '어려운 단어/숙어' 목록을 뽑아주는 LLM 래퍼.
+
+    반환 예:
+      {
+        "items": [
+          {
+            "term": "come up with",
+            "meaning_ko": "떠올리다, 생각해내다",
+            "examples": ["...", "..."]
+          },
+          ...
+        ]
+      }
     """
+    payload = {
+        "chat_history": chat_history,
+        "max_items": max_items,
+    }
+
     data = call_gemini_json(
-        system_prompt=DICTIONARY_SYSTEM_PROMPT,
-        user_payload=term,
+        system_prompt=SESSION_REVIEW_SYSTEM_PROMPT,
+        user_payload=json.dumps(payload, ensure_ascii=False),
         temperature=0.4,
         top_p=0.9,
-        max_tokens=512,
+        max_tokens=768,
     )
 
     if not data:
-        return {}
+        return {"items": []}
 
-    out_term = (data.get("term") or term).strip()
-    meaning_ko = (data.get("meaning_ko") or "").strip()
-    examples = data.get("examples") or []
+    items = data.get("items") or []
+    if not isinstance(items, list):
+        return {"items": []}
 
-    if not isinstance(examples, list):
-        examples = [str(examples)]
+    # 최소한의 정리
+    cleaned_items = []
+    for item in items:
+        try:
+            term = (str(item.get("term") or "")).strip()
+            meaning_ko = (str(item.get("meaning_ko") or "")).strip()
+            examples = item.get("examples") or []
+            if not isinstance(examples, list):
+                examples = [str(examples)]
+            examples = [str(e).strip() for e in examples if str(e).strip()]
+            if len(examples) > 2:
+                examples = examples[:2]
+            while len(examples) < 2:
+                examples.append(f"I often use the expression '{term}' in my daily conversations.")
+            if term:
+                cleaned_items.append(
+                    {
+                        "term": term,
+                        "meaning_ko": meaning_ko,
+                        "examples": examples,
+                    }
+                )
+        except Exception:
+            continue
 
-    examples = [str(e).strip() for e in examples if str(e).strip()]
+    if len(cleaned_items) > max_items:
+        cleaned_items = cleaned_items[:max_items]
 
-    # 예문 2개로 정규화
-    if len(examples) < 2:
-        while len(examples) < 2:
-            examples.append(f"I often use the phrase '{out_term}' in my daily conversations.")
-    elif len(examples) > 2:
-        examples = examples[:2]
-
-    return {
-        "term": out_term,
-        "meaning_ko": meaning_ko,
-        "examples": examples,
-    }
+    return {"items": cleaned_items}
