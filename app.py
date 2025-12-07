@@ -1,4 +1,3 @@
-# app.py
 """
 영어 회화 코치용 FastAPI 서버 (AI 서버 전용)
 
@@ -6,14 +5,14 @@
 - 4. AI & 음성 (AI / NLP / Speech) 영역을 담당하는 마이크로서비스
 
 엔드포인트:
-- POST /api/ai/chat                  : AI 텍스트 응답 (대화, userId별 히스토리/정확도 관리)
+- POST /api/ai/chat                  : AI 텍스트 응답 (대화, sessionId별 히스토리/정확도 관리)
 - POST /api/ai/feedback              : 문장 교정 + 교정 이유 제공 (버튼 기반, 자동 교정 아님)
 - POST /api/ai/tts                   : 텍스트 → 오디오(wav, base64)  ※ 회화 설정은 백엔드에서 내려줌
 - POST /api/ai/example-reply         : AI 응답에 대한 사용자 예시 응답 생성
 - POST /api/ai/dictionary            : 사용자 사전 등재용 단어/숙어 설명
 - POST /api/stt/recognize            : 오디오(PCM) → STT 텍스트 변환
-- GET  /api/stats/accuracy           : 정확도 통계 조회 (userId별)
-- GET  /api/conversation/history     : userId별 전체 대화 히스토리 조회
+- GET  /api/stats/accuracy           : 정확도 통계 조회 (sessionId별)
+- GET  /api/conversation/history     : sessionId별 전체 대화 히스토리 조회
 
 ※ 회화 설정(country/style/gender)은 이 서버에서 관리하지 않는다.
    메인 백엔드가 설정값을 조회한 뒤, 이 서버 호출 시 difficulty/register/accent/gender 를 함께 넘겨준다.
@@ -22,7 +21,7 @@
 import base64
 import json
 import logging
-from typing import List, Dict, Optional, Literal
+from typing import List, Dict, Optional, Literal, Any
 
 from fastapi import FastAPI, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,11 +32,66 @@ from llm import (
     gemini_analyze,
     generate_feedback,
     generate_example_reply,
-    generate_dictionary_entry,
+    generate_session_review_vocab
 )
 from stt import stt_transcribe, SAMPLE_RATE
 
 logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────
+# 공통 응답 유틸 (ok / err)
+# ─────────────────────────────────────────────────────────────
+
+def ok(
+    data: Dict[str, Any],
+    message: str = "ok",
+    meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    성공 응답 공통 포맷
+
+    예)
+    {
+      "success": true,
+      "data": {...},
+      "message": "ok",
+      "meta": {
+        "requestId": "a1b2c3",
+        "durationMs": 123
+      }
+    }
+    """
+    return {
+        "success": True,
+        "data": data,
+        "message": message,
+        "meta": meta or {},
+    }
+
+
+def err(
+    message: str,
+    code: str = "SERVER_ERROR",
+    trace_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    오류 응답 공통 포맷
+
+    예)
+    {
+      "success": false,
+      "code": "AUTH_001",
+      "message": "잘못된 인증 토큰입니다.",
+      "traceId": "a1b2c3"
+    }
+    """
+    return {
+        "success": False,
+        "code": code,
+        "message": message,
+        "traceId": trace_id,
+    }
+
 
 # ─────────────────────────────────────────────────────────────
 # FastAPI 앱 설정
@@ -56,41 +110,49 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ─────────────────────────────────────────────────────────────
+# 헬스 체크 / 루트
+# ─────────────────────────────────────────────────────────────
+
+@app.get("/health")
+def health():
+    return ok({"ok": True})
+
+
+@app.get("/")
+def root():
+    return ok({"service": "English Conversation Coach AI Server", "status": "ok"})
+
 
 # ─────────────────────────────────────────────────────────────
 # 공통 유틸
 # ─────────────────────────────────────────────────────────────
 
-class ApiResponse(BaseModel):
-    success: bool
-    data: Optional[dict] = None
-    error: Optional[str] = None
-
-
-def _user_key(user_id: Optional[str]) -> str:
-    """멀티 유저 상태 관리를 위한 키. userId 없으면 'anonymous'."""
-    return user_id or "anonymous"
+def _session_key(session_id: Optional[str]) -> str:
+    """멀티 세션 상태 관리를 위한 키. sessionId 없으면 'anonymous'."""
+    return session_id or "anonymous"
 
 
 # ─────────────────────────────────────────────────────────────
-# 전역 대화 상태 + 정확도 통계 (userId 별)
+# 전역 대화 상태 + 정확도 통계 (sessionId 별)
 # ─────────────────────────────────────────────────────────────
 
-# userId -> 대화 히스토리 / topic / 정확도 통계
+# sessionId -> 대화 히스토리 / topic / 정확도 통계
 CHAT_HISTORY: Dict[str, List[Dict[str, str]]] = {}
 CURRENT_TOPIC: Dict[str, Optional[str]] = {}
 
 ACCURACY_TOTAL_TURNS: Dict[str, int] = {}
 ACCURACY_NEEDS_CORRECTION: Dict[str, int] = {}
 
+FEEDBACK_HISTORY: Dict[str, List[Dict[str, str]]] = {}
 
-def _update_accuracy_stats(user_key: str, meta_json_str: str) -> None:
+def _update_accuracy_stats(session_key: str, meta_json_str: str) -> None:
     """
     meta_json_str 안의 meta.needs_correction 값을 보고 통계를 업데이트.
     (ai_chat 안에서만 사용, /api/ai/feedback 과는 무관)
     """
-    total = ACCURACY_TOTAL_TURNS.get(user_key, 0) + 1
-    ACCURACY_TOTAL_TURNS[user_key] = total
+    total = ACCURACY_TOTAL_TURNS.get(session_key, 0) + 1
+    ACCURACY_TOTAL_TURNS[session_key] = total
 
     try:
         meta_obj = json.loads(meta_json_str or "{}")
@@ -98,10 +160,10 @@ def _update_accuracy_stats(user_key: str, meta_json_str: str) -> None:
         meta_obj = {}
 
     if isinstance(meta_obj, dict) and meta_obj.get("needs_correction"):
-        ACCURACY_NEEDS_CORRECTION[user_key] = ACCURACY_NEEDS_CORRECTION.get(user_key, 0) + 1
+        ACCURACY_NEEDS_CORRECTION[session_key] = ACCURACY_NEEDS_CORRECTION.get(session_key, 0) + 1
 
 
-def _compute_accuracy_score(user_key: str) -> dict:
+def _compute_accuracy_score(session_key: str) -> dict:
     """
     점수 공식:
       score = 100 - (피드백(=수정 필요) / 전체 사용자 응답) * 25
@@ -109,8 +171,8 @@ def _compute_accuracy_score(user_key: str) -> dict:
     - 최소 0, 최대 100 으로 클램핑
     - 아직 한 번도 응답이 없으면 100점으로 처리
     """
-    total = ACCURACY_TOTAL_TURNS.get(user_key, 0)
-    corrected = ACCURACY_NEEDS_CORRECTION.get(user_key, 0)
+    total = ACCURACY_TOTAL_TURNS.get(session_key, 0)
+    corrected = ACCURACY_NEEDS_CORRECTION.get(session_key, 0)
 
     if total <= 0:
         return {"total": 0, "corrected": 0, "score": 100.0}
@@ -128,22 +190,19 @@ def _compute_accuracy_score(user_key: str) -> dict:
 # 새 대화 세션 시작시 상태 초기화
 # ─────────────────────────────────────────────────────────────
 
-@app.post("/api/conversation/reset", response_model=ApiResponse)
-async def reset_conversation(userId: Optional[str] = Body(default=None)):
+@app.post("/api/conversation/reset")
+async def reset_conversation(sessionId: Optional[str] = Body(default=None)):
     """
-    특정 userId(또는 anonymous)에 대한 대화 상태/정확도 통계를 초기화.
+    특정 sessionId(또는 anonymous)에 대한 대화 상태/정확도 통계를 초기화.
     - 프론트/백엔드에서 '새 세션 시작' 버튼 눌렀을 때 호출하면 됨.
     """
-    user_key = _user_key(userId)
-    CHAT_HISTORY.pop(user_key, None)
-    CURRENT_TOPIC.pop(user_key, None)
-    ACCURACY_TOTAL_TURNS.pop(user_key, None)
-    ACCURACY_NEEDS_CORRECTION.pop(user_key, None)
+    session_key = _session_key(sessionId)
+    CHAT_HISTORY.pop(session_key, None)
+    CURRENT_TOPIC.pop(session_key, None)
+    ACCURACY_TOTAL_TURNS.pop(session_key, None)
+    ACCURACY_NEEDS_CORRECTION.pop(session_key, None)
 
-    return ApiResponse(
-        success=True,
-        data={"userId": user_key},
-    )
+    return ok({"sessionId": session_key})
 
 
 # ─────────────────────────────────────────────────────────────
@@ -157,38 +216,20 @@ class STTRequest(BaseModel):
     sampleRate: Hz (생략 시 STT 기본 SAMPLE_RATE 사용)
     """
     audio: str
-    sampleRate: Optional[int] = None
+    sampleRate: Optional[int] = 48000
 
 
-@app.post("/api/stt/recognize", response_model=ApiResponse)
+@app.post("/api/stt/recognize")
 async def stt_recognize(req: STTRequest):
     """
     백엔드에서 오디오를 전송받아 STT로 텍스트를 반환하는 엔드포인트.
-
-    요청 예시:
-    {
-      "audio": "<base64-encoded PCM16 mono>",
-      "sampleRate": 48000
-    }
-
-    응답 예시:
-    {
-      "success": true,
-      "data": {
-        "transcript": "Hello, how are you?",
-        "altSegments": [
-          ["Hello, how are you?", "Hello, how are u?"],
-          ...
-        ]
-      }
-    }
     """
     # 1) base64 → bytes 디코딩
     try:
         pcm_bytes = base64.b64decode(req.audio)
     except Exception as e:
         logger.error("STT decode error: %s", e, exc_info=True)
-        return ApiResponse(success=False, error="Invalid base64 audio")
+        return err("Invalid base64 audio")
 
     sr = req.sampleRate or SAMPLE_RATE
 
@@ -197,14 +238,13 @@ async def stt_recognize(req: STTRequest):
         transcript, alt_segments = await stt_transcribe(pcm_bytes, sr=sr)
     except Exception as e:
         logger.error("STT recognize error in endpoint: %s", e, exc_info=True)
-        return ApiResponse(success=False, error="STT error")
+        return err("STT error")
 
-    return ApiResponse(
-        success=True,
-        data={
+    return ok(
+        {
             "transcript": transcript,
             "altSegments": alt_segments,
-        },
+        }
     )
 
 
@@ -214,33 +254,25 @@ async def stt_recognize(req: STTRequest):
 
 class ChatRequest(BaseModel):
     text: str
-    userId: Optional[str] = None
+    sessionId: Optional[str] = None
 
     # 메인 백엔드에서 회화 설정을 기반으로 내려주는 옵션 값들
     difficulty: Optional[Literal["easy", "medium", "hard"]] = None
     register: Optional[Literal["casual", "formal"]] = None
 
 
-@app.post("/api/ai/chat", response_model=ApiResponse)
+@app.post("/api/ai/chat")
 async def ai_chat(req: ChatRequest):
     """
     요청 예시:
     {
       "text": "Can you help me practice English?",
-      "userId": "u_123",
+      "sessionId": "s_123",
       "difficulty": "medium",   // optional, 없으면 medium
       "register": "casual"      // optional, 없으면 casual
     }
-
-    응답:
-    {
-      "success": true,
-      "data": {
-        "text": "Sure! What part of English would you like to practice?"
-      }
-    }
     """
-    user_key = _user_key(req.userId)
+    session_key = _session_key(req.sessionId)
 
     # 회화 설정은 메인 백엔드가 관리 → 이 서버는 단지 파라미터만 사용
     difficulty = req.difficulty or "medium"
@@ -248,9 +280,9 @@ async def ai_chat(req: ChatRequest):
 
     transcript = req.text
 
-    # user별 상태 가져오기 (전체 히스토리)
-    history = CHAT_HISTORY.setdefault(user_key, [])
-    current_topic = CURRENT_TOPIC.get(user_key)
+    # session별 상태 가져오기 (전체 히스토리)
+    history = CHAT_HISTORY.setdefault(session_key, [])
+    current_topic = CURRENT_TOPIC.get(session_key)
 
     # gemini_analyze 사용 (내부에서 전체 히스토리 활용)
     try:
@@ -263,7 +295,7 @@ async def ai_chat(req: ChatRequest):
         )
     except Exception as e:
         logger.error("ai_chat LLM error: %s", e, exc_info=True)
-        return ApiResponse(success=False, error="LLM error")
+        return err("LLM error")
 
     reply_en = result["reply_en"]
     corrected = result["corrected_en"]
@@ -274,20 +306,17 @@ async def ai_chat(req: ChatRequest):
         meta_obj = json.loads(meta_str or "{}")
         new_topic = meta_obj.get("topic") if isinstance(meta_obj, dict) else None
         if new_topic:
-            CURRENT_TOPIC[user_key] = new_topic
+            CURRENT_TOPIC[session_key] = new_topic
     except Exception as e:
         logger.warning("Failed to parse meta in ai_chat: %s", e)
-    _update_accuracy_stats(user_key, meta_str)
+    _update_accuracy_stats(session_key, meta_str)
 
     # 전체 대화 히스토리 업데이트 (자르지 않고 append)
     history.append(
         {"user": transcript, "corrected_en": corrected, "reply_en": reply_en}
     )
 
-    return ApiResponse(
-        success=True,
-        data={"text": reply_en},
-    )
+    return ok({"text": reply_en})
 
 
 # ─────────────────────────────────────────────────────────────
@@ -296,67 +325,82 @@ async def ai_chat(req: ChatRequest):
 # ─────────────────────────────────────────────────────────────
 
 class FeedbackRequest(BaseModel):
-    text: str  # 사용자가 실제로 말한 영어 문장
+    text: str               # 사용자가 실제로 말한 영어 문장
+    sessionId: Optional[str] = None  # 어떤 세션에서 받은 피드백인지
 
 
-@app.post("/api/ai/feedback", response_model=ApiResponse)
+@app.post("/api/ai/feedback")
 async def ai_feedback(req: FeedbackRequest):
     """
     사용자가 '피드백 보기' 버튼을 눌렀을 때 특정 문장에 대한 교정을 요청하는 엔드포인트.
 
-    자연스럽지 않은 문장 예시 응답:
-    {
-      "success": true,
-      "data": {
-        "natural": false,
-        "corrected_en": "I really like playing soccer.",
-        "reason_ko": "왜 이렇게 고쳤는지 한국어 설명..."
+    - 입력:
+      {
+        "text": "I goed to school yesterday.",
+        "sessionId": "s_123"   // optional
       }
-    }
 
-    이미 자연스러운 문장 예시 응답:
-    {
-      "success": true,
-      "data": {
-        "natural": true,
-        "message": "자연스러운 문장이에요!"
+    - 출력 예시 (교정 필요 O):
+      {
+        "success": true,
+        "data": {
+          "natural": false,
+          "corrected_en": "I went to school yesterday.",
+          "reason_ko": "...왜 틀렸는지 설명...",
+        },
+        "message": "ok",
+        "meta": {}
       }
-    }
 
-    ※ 이 엔드포인트는 정확도 통계(ACCURACY_*)를 전혀 건드리지 않으므로
-       자연스러운 문장은 정확도 계산에서도 제외된다.
+    - 출력 예시 (이미 자연스러움):
+      {
+        "success": true,
+        "data": {
+          "natural": true,
+          "message": "자연스러운 문장이에요!"
+        },
+        "message": "ok",
+        "meta": {}
+      }
     """
+    session_key = _session_key(req.sessionId)
+
     data = generate_feedback(req.text)
 
     if not data:
-        return ApiResponse(
-            success=False,
-            error="LLM response empty",
-        )
+        return err("LLM response empty")
 
     needs_correction = bool(data.get("needs_correction"))
 
-    # 이미 자연스러운 문장 → 한 줄 메시지만 반환
+    # 이미 자연스러운 문장 → 한 줄 메시지만 반환 (히스토리에는 저장 안 함)
     if not needs_correction:
-        return ApiResponse(
-            success=True,
-            data={
+        return ok(
+            {
                 "natural": True,
                 "message": "자연스러운 문장이에요!",
-            },
+            }
         )
 
     # 교정 필요 → 교정 문장 + 이유 반환
     corrected_en = data.get("corrected_en", "")
     reason_ko = data.get("reason_ko", "")
 
-    return ApiResponse(
-        success=True,
-        data={
+    # 해당 세션의 피드백 히스토리에 기록
+    feedback_list = FEEDBACK_HISTORY.setdefault(session_key, [])
+    feedback_list.append(
+        {
+            "original": req.text,
+            "corrected_en": corrected_en,
+            "reason_ko": reason_ko,
+        }
+    )
+
+    return ok(
+        {
             "natural": False,
             "corrected_en": corrected_en,
             "reason_ko": reason_ko,
-        },
+        }
     )
 
 
@@ -376,24 +420,10 @@ class TTSRequest(BaseModel):
     gender: Optional[Literal["male", "female"]] = None
 
 
-@app.post("/api/ai/tts", response_model=ApiResponse)
+@app.post("/api/ai/tts")
 async def tts_endpoint(req: TTSRequest):
     """
-    요청 예:
-      {
-        "text": "Hello! How can I help you today?",
-        "accent": "uk",          // optional, 없으면 "us"
-        "gender": "female"       // optional, 없으면 "female"
-      }
-
-    응답:
-      {
-        "success": true,
-        "data": {
-          "audio": "<base64-encoded-wav>",
-          "mime": "audio/wav"
-        }
-      }
+    텍스트를 TTS로 변환해 base64-encoded wav를 반환.
     """
     # 기본값 적용
     accent = (req.accent or "us").lower()          # us / uk / au
@@ -408,16 +438,15 @@ async def tts_endpoint(req: TTSRequest):
         )
     except Exception as e:
         logger.error("TTS synth error in endpoint: %s", e, exc_info=True)
-        return ApiResponse(success=False, error="TTS error")
+        return err("TTS error")
 
     audio_b64 = base64.b64encode(pcm_wav_bytes).decode("ascii")
 
-    return ApiResponse(
-        success=True,
-        data={
+    return ok(
+        {
             "audio": audio_b64,
             "mime": "audio/wav",
-        },
+        }
     )
 
 
@@ -427,19 +456,19 @@ async def tts_endpoint(req: TTSRequest):
 
 class ExampleReplyRequest(BaseModel):
     ai_text: str  # AI가 방금 말한 문장
-    userId: Optional[str] = None
+    sessionId: Optional[str] = None
 
 
-@app.post("/api/ai/example-reply", response_model=ApiResponse)
+@app.post("/api/ai/example-reply")
 async def ai_example_reply(req: ExampleReplyRequest):
     """
     AI 응답 텍스트와 전체 대화 맥락을 바탕으로,
     사용자가 말해볼 만한 영어 예시 한 문장을 생성.
     난이도/말투는 이 엔드포인트에서 별도로 관리하지 않는다.
     """
-    user_key = _user_key(req.userId)
+    session_key = _session_key(req.sessionId)
 
-    history = CHAT_HISTORY.get(user_key, [])
+    history = CHAT_HISTORY.get(session_key, [])
 
     data = generate_example_reply(
         ai_text=req.ai_text,
@@ -447,72 +476,112 @@ async def ai_example_reply(req: ExampleReplyRequest):
     )
 
     if not data:
-        return ApiResponse(success=False, error="LLM response empty")
+        return err("LLM response empty")
 
     example = data.get("reply_example", "").strip()
     if not example:
         example = "Let me share my opinion about that."
 
-    return ApiResponse(
-        success=True,
-        data={"reply_example": example},
-    )
+    return ok({"reply_example": example})
 
 
 # ─────────────────────────────────────────────────────────────
-# 5) 사용자 사전 등재용 단어/숙어 설명 - POST /api/ai/dictionary
+# 5) 세션 복습 - POST /api/ai/review
 # ─────────────────────────────────────────────────────────────
 
-class DictionaryEntryRequest(BaseModel):
-    term: str  # 영단어 또는 숙어
+class ReviewRequest(BaseModel):
+    sessionId: Optional[str] = None
+    maxItems: Optional[int] = 5
 
 
-@app.post("/api/ai/dictionary", response_model=ApiResponse)
-async def ai_dictionary(req: DictionaryEntryRequest):
+@app.post("/api/ai/review")
+async def ai_review(req: ReviewRequest):
     """
-    사용자 사전 등재용 엔드포인트.
-    영단어나 숙어 텍스트를 입력받아 한국어 뜻과 예문 2개를 반환.
-    """
-    data = generate_dictionary_entry(req.term)
+    세션 기준 복습 엔드포인트.
 
-    if not data:
-        return ApiResponse(success=False, error="LLM response empty")
+    입력:
+      {
+        "sessionId": "s_123",   // optional, 없으면 anonymous
+        "maxItems": 5           // optional, 어려운 표현 최대 개수
+      }
 
-    term = data.get("term", req.term)
-    meaning_ko = data.get("meaning_ko", "")
-    examples = data.get("examples", [])
+    동작:
+      1) 해당 sessionId의 전체 대화 히스토리(CHAT_HISTORY)를 기반으로
+         AI가 사용한 '어려운 단어/숙어'를 LLM에게 뽑도록 요청.
+      2) 해당 sessionId가 /api/ai/feedback에서 받은 피드백 기록(FEEDBACK_HISTORY)을 함께 반환.
 
-    return ApiResponse(
-        success=True,
-        data={
-            "term": term,
-            "meaning_ko": meaning_ko,
-            "examples": examples,
+    응답 예시:
+      {
+        "success": true,
+        "data": {
+          "sessionId": "s_123",
+          "vocabulary": [
+            {
+              "term": "come up with",
+              "meaning_ko": "떠올리다, 생각해내다",
+              "examples": ["...", "..."]
+            },
+            ...
+          ],
+          "feedback": [
+            {
+              "original": "I goed to school yesterday.",
+              "corrected_en": "I went to school yesterday.",
+              "reason_ko": "go의 과거형은 went입니다. ..."
+            },
+            ...
+          ]
         },
+        "message": "ok",
+        "meta": {}
+      }
+    """
+    session_key = _session_key(req.sessionId)
+    max_items = req.maxItems or 5
+
+    # 1) 세션 전체 대화 (AI가 사용한 reply_en 포함)
+    chat_history = CHAT_HISTORY.get(session_key, [])
+
+    # 2) 세션 동안 받은 피드백 목록
+    feedback_history = FEEDBACK_HISTORY.get(session_key, [])
+
+    # 3) LLM으로부터 '어려운 단어/숙어' 리스트 받기
+    vocab_data = generate_session_review_vocab(
+        chat_history=chat_history,
+        max_items=max_items,
     )
+    vocab_items = vocab_data.get("items", [])
+
+    return ok(
+        {
+            "sessionId": session_key,
+            "vocabulary": vocab_items,
+            "feedback": feedback_history,
+        }
+    )
+
 
 
 # ─────────────────────────────────────────────────────────────
 # 6) 정확도 조회 - GET /api/stats/accuracy
 # ─────────────────────────────────────────────────────────────
 
-@app.get("/api/stats/accuracy", response_model=ApiResponse)
-async def get_accuracy(userId: Optional[str] = Query(default=None)):
+@app.get("/api/stats/accuracy")
+async def get_accuracy(sessionId: Optional[str] = Query(default=None)):
     """
     전체 사용자 응답 중 LLM이 '수정 필요(needs_correction)'로 판단한 비율을 기반으로
     100 - (피드백 개수 / 전체 사용자 응답) * 25 점수를 계산해서 반환.
-    userId 없으면 'anonymous' 키 기준으로 계산.
+    sessionId 없으면 'anonymous' 키 기준으로 계산.
     """
-    user_key = _user_key(userId)
-    stats = _compute_accuracy_score(user_key)
-    return ApiResponse(
-        success=True,
-        data={
-            "userId": user_key,
+    session_key = _session_key(sessionId)
+    stats = _compute_accuracy_score(session_key)
+    return ok(
+        {
+            "sessionId": session_key,
             "totalTurns": stats["total"],
             "correctedTurns": stats["corrected"],
             "accuracy": stats["score"],
-        },
+        }
     )
 
 
@@ -520,20 +589,18 @@ async def get_accuracy(userId: Optional[str] = Query(default=None)):
 # 7) 전체 대화 히스토리 조회 - GET /api/conversation/history
 # ─────────────────────────────────────────────────────────────
 
-@app.get("/api/conversation/history", response_model=ApiResponse)
-async def get_conversation_history(userId: Optional[str] = Query(default=None)):
+@app.get("/api/conversation/history")
+async def get_conversation_history(sessionId: Optional[str] = Query(default=None)):
     """
-    userId별 전체 대화 히스토리를 반환.
+    sessionId별 전체 대화 히스토리를 반환.
     메인 백엔드에서 '세션 종료' 시 이 엔드포인트를 호출해서
     해당 세션 동안의 전체 대화 로그를 가져갈 수 있다.
     """
-    user_key = _user_key(userId)
-    history = CHAT_HISTORY.get(user_key, [])
-    return ApiResponse(
-        success=True,
-        data={
-            "userId": user_key,
+    session_key = _session_key(sessionId)
+    history = CHAT_HISTORY.get(session_key, [])
+    return ok(
+        {
+            "sessionId": session_key,
             "history": history,
-        },
+        }
     )
-
