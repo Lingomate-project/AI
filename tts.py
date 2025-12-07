@@ -11,12 +11,6 @@ from datetime import datetime
 from typing import Final, Tuple, Optional
 
 import logging
-import numpy as np
-try:
-    import sounddevice as sd
-except Exception:
-    sd = None
-    logger.warning("sounddevice import failed; local audio playback will be disabled.")
 from google.cloud import texttospeech as tts
 
 logger = logging.getLogger(__name__)
@@ -49,15 +43,11 @@ def _timestamp() -> str:
 
 
 def _play_pcm16(pcm: bytes, sr: int) -> None:
-    if sd is None:
-        logger.info("sounddevice is not available; skip local playback.")
-        return
-
-    try:
-        sd.play(np.frombuffer(pcm, dtype=np.int16), samplerate=sr)
-        sd.wait()
-    except Exception as e:
-        logger.warning("TTS playback failed: %s", e, exc_info=True)
+    """
+    서버(Elastic Beanstalk) 환경에서는 로컬 스피커 재생을 하지 않으므로 NO-OP.
+    """
+    logger.info("Skipping local audio playback (no sounddevice in server environment).")
+    return
 
 
 def _save_wav(pcm: bytes, path: str, sr: int) -> None:
@@ -108,6 +98,7 @@ def speak_reply_en(
 ) -> str:
     """
     로컬 테스트용: TTS 재생 + wav 파일 저장.
+    (서버에서는 _play_pcm16이 NO-OP이므로 파일만 저장됨)
     """
     voice_name, lang_for_tts = _select_voice(accent, gender)
 
@@ -202,4 +193,3 @@ def synthesize_wav_bytes(
         wf.writeframes(pcm)
 
     return buf.getvalue()
-
