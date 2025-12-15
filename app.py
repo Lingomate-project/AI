@@ -1,22 +1,5 @@
-"""
-영어 회화 코치용 FastAPI 서버 (AI 서버 전용)
+#영어 회화 코치용 FastAPI 서버 (AI 서버 전용)
 
-담당 범위 (LingoMate 명세서 기준):
-- 4. AI & 음성 (AI / NLP / Speech) 영역을 담당하는 마이크로서비스
-
-엔드포인트:
-- POST /api/ai/chat                  : AI 텍스트 응답 (대화, sessionId별 히스토리/정확도 관리)
-- POST /api/ai/feedback              : 문장 교정 + 교정 이유 제공 (버튼 기반, 자동 교정 아님)
-- POST /api/ai/tts                   : 텍스트 → 오디오(wav, base64)  ※ 회화 설정은 백엔드에서 내려줌
-- POST /api/ai/example-reply         : AI 응답에 대한 사용자 예시 응답 생성
-- POST /api/ai/dictionary            : 사용자 사전 등재용 단어/숙어 설명
-- POST /api/stt/recognize            : 오디오(PCM) → STT 텍스트 변환
-- GET  /api/stats/accuracy           : 정확도 통계 조회 (sessionId별)
-- GET  /api/conversation/history     : sessionId별 전체 대화 히스토리 조회
-
-※ 회화 설정(country/style/gender)은 이 서버에서 관리하지 않는다.
-   메인 백엔드가 설정값을 조회한 뒤, 이 서버 호출 시 difficulty/register/accent/gender 를 함께 넘겨준다.
-"""
 
 import base64
 import json
@@ -25,16 +8,17 @@ from typing import List, Dict, Optional, Literal, Any
 
 from fastapi import FastAPI, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel
 
-from tts import synthesize_wav_bytes
+from tts import synthesize_pcm_bytes, TTSError
 from llm import (
     gemini_analyze,
     generate_feedback,
     generate_example_reply,
-    generate_session_review_vocab
+    generate_session_review_vocab,
 )
-from stt import stt_transcribe, SAMPLE_RATE
+from stt import stt_transcribe, SAMPLE_RATE, STTError
 
 logger = logging.getLogger(__name__)
 
@@ -42,54 +26,37 @@ logger = logging.getLogger(__name__)
 # 공통 응답 유틸 (ok / err)
 # ─────────────────────────────────────────────────────────────
 
-def ok(
-    data: Dict[str, Any],
-    message: str = "ok",
-    meta: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+def ok(data: Any) -> Dict[str, Any]:
     """
-    성공 응답 공통 포맷
+    성공 응답 공통 포맷 (ApiResponse)
 
-    예)
     {
       "success": true,
-      "data": {...},
-      "message": "ok",
-      "meta": {
-        "requestId": "a1b2c3",
-        "durationMs": 123
-      }
+      "data": { ... },
+      "error": null
     }
     """
     return {
         "success": True,
         "data": data,
-        "message": message,
-        "meta": meta or {},
+        "error": None,
     }
 
 
-def err(
-    message: str,
-    code: str = "SERVER_ERROR",
-    trace_id: Optional[str] = None,
-) -> Dict[str, Any]:
+def err(message: str, data: Optional[Any] = None) -> Dict[str, Any]:
     """
-    오류 응답 공통 포맷
+    오류 응답 공통 포맷 (ApiResponse)
 
-    예)
     {
       "success": false,
-      "code": "AUTH_001",
-      "message": "잘못된 인증 토큰입니다.",
-      "traceId": "a1b2c3"
+      "data": { ... }  # 없으면 {}
+      "error": "에러 메시지"
     }
     """
     return {
         "success": False,
-        "code": code,
-        "message": message,
-        "traceId": trace_id,
+        "data": data if data is not None else {},
+        "error": message,
     }
 
 
@@ -101,10 +68,10 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# 필요시 CORS 허용 (프론트/백엔드에서 호출할 수 있도록)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # 배포 시에는 도메인으로 제한 권장
+    allow_origins=["*"],  
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -145,6 +112,7 @@ ACCURACY_TOTAL_TURNS: Dict[str, int] = {}
 ACCURACY_NEEDS_CORRECTION: Dict[str, int] = {}
 
 FEEDBACK_HISTORY: Dict[str, List[Dict[str, str]]] = {}
+
 
 def _update_accuracy_stats(session_key: str, meta_json_str: str) -> None:
     """
@@ -187,63 +155,48 @@ def _compute_accuracy_score(session_key: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────
-# 새 대화 세션 시작시 상태 초기화
-# ─────────────────────────────────────────────────────────────
-
-@app.post("/api/conversation/reset")
-async def reset_conversation(sessionId: Optional[str] = Body(default=None)):
-    """
-    특정 sessionId(또는 anonymous)에 대한 대화 상태/정확도 통계를 초기화.
-    - 프론트/백엔드에서 '새 세션 시작' 버튼 눌렀을 때 호출하면 됨.
-    """
-    session_key = _session_key(sessionId)
-    CHAT_HISTORY.pop(session_key, None)
-    CURRENT_TOPIC.pop(session_key, None)
-    ACCURACY_TOTAL_TURNS.pop(session_key, None)
-    ACCURACY_NEEDS_CORRECTION.pop(session_key, None)
-
-    return ok({"sessionId": session_key})
-
-
-# ─────────────────────────────────────────────────────────────
 # 0) STT - 오디오(PCM) → 텍스트
 #     POST /api/stt/recognize
 # ─────────────────────────────────────────────────────────────
 
-class STTRequest(BaseModel):
-    """
-    audio: base64로 인코딩된 LINEAR16 PCM 모노 오디오
-    sampleRate: Hz (생략 시 STT 기본 SAMPLE_RATE 사용)
-    """
-    audio: str
-    sampleRate: Optional[int] = 48000
-
-
 @app.post("/api/stt/recognize")
-async def stt_recognize(req: STTRequest):
+async def stt_recognize(
+    pcm: bytes = Body(..., media_type="application/octet-stream"),
+):
     """
-    백엔드에서 오디오를 전송받아 STT로 텍스트를 반환하는 엔드포인트.
+    16kHz, mono, LINEAR16 PCM 바이트를 그대로 받아서 STT를 수행하는 엔드포인트.
     """
-    # 1) base64 → bytes 디코딩
-    try:
-        pcm_bytes = base64.b64decode(req.audio)
-    except Exception as e:
-        logger.error("STT decode error: %s", e, exc_info=True)
-        return err("Invalid base64 audio")
+    logger.info("STT request received: %d bytes (16kHz PCM)", len(pcm))
 
-    sr = req.sampleRate or SAMPLE_RATE
-
-    # 2) STT 실행
     try:
-        transcript, alt_segments = await stt_transcribe(pcm_bytes, sr=sr)
+        transcript, alt_candidates = await stt_transcribe(pcm, sr=SAMPLE_RATE)
+    except STTError as e:
+        logger.error(
+            "STTError in endpoint: stage=%s, detail=%s",
+            e.stage,
+            e.detail,
+            exc_info=True,
+        )
+        return err(
+            "STT error",
+            data={
+                "stage": e.stage,
+                "detail": e.detail,
+            },
+        )
     except Exception as e:
-        logger.error("STT recognize error in endpoint: %s", e, exc_info=True)
-        return err("STT error")
+        logger.error("Unknown STT error in endpoint: %s", e, exc_info=True)
+        return err(
+            "STT error",
+            data={
+                "stage": "unknown",
+                "detail": str(e),
+            },
+        )
 
     return ok(
         {
             "transcript": transcript,
-            "altSegments": alt_segments,
         }
     )
 
@@ -274,7 +227,6 @@ async def ai_chat(req: ChatRequest):
     """
     session_key = _session_key(req.sessionId)
 
-    # 회화 설정은 메인 백엔드가 관리 → 이 서버는 단지 파라미터만 사용
     difficulty = req.difficulty or "medium"
     register = req.register or "casual"
 
@@ -284,7 +236,7 @@ async def ai_chat(req: ChatRequest):
     history = CHAT_HISTORY.setdefault(session_key, [])
     current_topic = CURRENT_TOPIC.get(session_key)
 
-    # gemini_analyze 사용 (내부에서 전체 히스토리 활용)
+    # gemini_analyze 사용
     try:
         result = gemini_analyze(
             transcript=transcript,
@@ -333,35 +285,6 @@ class FeedbackRequest(BaseModel):
 async def ai_feedback(req: FeedbackRequest):
     """
     사용자가 '피드백 보기' 버튼을 눌렀을 때 특정 문장에 대한 교정을 요청하는 엔드포인트.
-
-    - 입력:
-      {
-        "text": "I goed to school yesterday.",
-        "sessionId": "s_123"   // optional
-      }
-
-    - 출력 예시 (교정 필요 O):
-      {
-        "success": true,
-        "data": {
-          "natural": false,
-          "corrected_en": "I went to school yesterday.",
-          "reason_ko": "...왜 틀렸는지 설명...",
-        },
-        "message": "ok",
-        "meta": {}
-      }
-
-    - 출력 예시 (이미 자연스러움):
-      {
-        "success": true,
-        "data": {
-          "natural": true,
-          "message": "자연스러운 문장이에요!"
-        },
-        "message": "ok",
-        "meta": {}
-      }
     """
     session_key = _session_key(req.sessionId)
 
@@ -405,7 +328,7 @@ async def ai_feedback(req: FeedbackRequest):
 
 
 # ─────────────────────────────────────────────────────────────
-# 3) TTS - 텍스트 → 오디오 (base64 wav)
+# 3) TTS - 텍스트 → 오디오 (base64 pcm)
 #     POST /api/ai/tts
 # ─────────────────────────────────────────────────────────────
 
@@ -423,30 +346,101 @@ class TTSRequest(BaseModel):
 @app.post("/api/ai/tts")
 async def tts_endpoint(req: TTSRequest):
     """
-    텍스트를 TTS로 변환해 base64-encoded wav를 반환.
+    텍스트를 TTS로 변환해 base64-encoded PCM(LINEAR16)을 반환.
     """
-    # 기본값 적용
-    accent = (req.accent or "us").lower()          # us / uk / au
-    gender_long = (req.gender or "female").lower() # male / female
+    accent = (req.accent or "us").lower()
+    gender_long = (req.gender or "female").lower()
     gender_short = "f" if gender_long == "female" else "m"
 
     try:
-        pcm_wav_bytes = synthesize_wav_bytes(
+        pcm_bytes, sample_rate = synthesize_pcm_bytes(
             text=req.text,
-            accent=accent,          # "us" / "uk" / "au"
-            gender=gender_short,    # "f" / "m"
+            accent=accent,
+            gender=gender_short,
+            sr=16_000,
+        )
+    except TTSError as e:
+        logger.error(
+            "TTSError in /api/ai/tts: stage=%s, detail=%s",
+            e.stage,
+            e.detail,
+            exc_info=True,
+        )
+        return err(
+            "TTS error",
+            data={
+                "stage": e.stage,
+                "detail": e.detail,
+            },
         )
     except Exception as e:
-        logger.error("TTS synth error in endpoint: %s", e, exc_info=True)
-        return err("TTS error")
+        logger.error("Unknown TTS error in /api/ai/tts: %s", e, exc_info=True)
+        return err(
+            "TTS error",
+            data={
+                "stage": "unknown",
+                "detail": str(e),
+            },
+        )
 
-    audio_b64 = base64.b64encode(pcm_wav_bytes).decode("ascii")
+    audio_b64 = base64.b64encode(pcm_bytes).decode("ascii")
 
     return ok(
         {
             "audio": audio_b64,
-            "mime": "audio/wav",
+            "sampleRate": sample_rate,
+            "encoding": "LINEAR16",
         }
+    )
+
+
+@app.post("/api/ai/tts/pcm", response_class=Response)
+async def tts_pcm_endpoint(req: TTSRequest):
+    """
+    텍스트를 TTS로 변환해 순수 PCM(LINEAR16) 바이트 스트림으로 반환.
+    """
+    accent = (req.accent or "us").lower()
+    gender_long = (req.gender or "female").lower()
+    gender_short = "f" if gender_long == "female" else "m"
+
+    try:
+        pcm_bytes, sample_rate = synthesize_pcm_bytes(
+            text=req.text,
+            accent=accent,
+            gender=gender_short,
+            sr=16_000,
+        )
+    except TTSError as e:
+        logger.error(
+            "TTSError in /api/ai/tts/pcm: stage=%s, detail=%s",
+            e.stage,
+            e.detail,
+            exc_info=True,
+        )
+        msg = f"TTS error [{e.stage}] {e.detail}"
+        return Response(
+            content=msg.encode("utf-8"),
+            status_code=500,
+            media_type="text/plain; charset=utf-8",
+        )
+    except Exception as e:
+        logger.error("Unknown TTS error in /api/ai/tts/pcm: %s", e, exc_info=True)
+        msg = f"TTS error [unknown] {e}"
+        return Response(
+            content=msg.encode("utf-8"),
+            status_code=500,
+            media_type="text/plain; charset=utf-8",
+        )
+
+    headers = {
+        "X-Audio-Sample-Rate": str(sample_rate),
+        "X-Audio-Encoding": "LINEAR16",
+    }
+
+    return Response(
+        content=pcm_bytes,
+        media_type="application/octet-stream",
+        headers=headers,
     )
 
 
@@ -498,43 +492,6 @@ class ReviewRequest(BaseModel):
 async def ai_review(req: ReviewRequest):
     """
     세션 기준 복습 엔드포인트.
-
-    입력:
-      {
-        "sessionId": "s_123",   // optional, 없으면 anonymous
-        "maxItems": 5           // optional, 어려운 표현 최대 개수
-      }
-
-    동작:
-      1) 해당 sessionId의 전체 대화 히스토리(CHAT_HISTORY)를 기반으로
-         AI가 사용한 '어려운 단어/숙어'를 LLM에게 뽑도록 요청.
-      2) 해당 sessionId가 /api/ai/feedback에서 받은 피드백 기록(FEEDBACK_HISTORY)을 함께 반환.
-
-    응답 예시:
-      {
-        "success": true,
-        "data": {
-          "sessionId": "s_123",
-          "vocabulary": [
-            {
-              "term": "come up with",
-              "meaning_ko": "떠올리다, 생각해내다",
-              "examples": ["...", "..."]
-            },
-            ...
-          ],
-          "feedback": [
-            {
-              "original": "I goed to school yesterday.",
-              "corrected_en": "I went to school yesterday.",
-              "reason_ko": "go의 과거형은 went입니다. ..."
-            },
-            ...
-          ]
-        },
-        "message": "ok",
-        "meta": {}
-      }
     """
     session_key = _session_key(req.sessionId)
     max_items = req.maxItems or 5
@@ -542,24 +499,35 @@ async def ai_review(req: ReviewRequest):
     # 1) 세션 전체 대화 (AI가 사용한 reply_en 포함)
     chat_history = CHAT_HISTORY.get(session_key, [])
 
-    # 2) 세션 동안 받은 피드백 목록
-    feedback_history = FEEDBACK_HISTORY.get(session_key, [])
-
-    # 3) LLM으로부터 '어려운 단어/숙어' 리스트 받기
+    # 2) LLM으로부터 '어려운 단어/숙어' 리스트 받기
     vocab_data = generate_session_review_vocab(
         chat_history=chat_history,
         max_items=max_items,
     )
-    vocab_items = vocab_data.get("items", [])
+    raw_items = vocab_data.get("items", [])
+
+    # 3) term + meaning_ko만 추려서 반환
+    vocab_items = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        term = item.get("term")
+        meaning_ko = item.get("meaning_ko")
+        if not term or not meaning_ko:
+            continue
+        vocab_items.append(
+            {
+                "term": term,
+                "meaning_ko": meaning_ko,
+            }
+        )
 
     return ok(
         {
             "sessionId": session_key,
             "vocabulary": vocab_items,
-            "feedback": feedback_history,
         }
     )
-
 
 
 # ─────────────────────────────────────────────────────────────
@@ -578,8 +546,6 @@ async def get_accuracy(sessionId: Optional[str] = Query(default=None)):
     return ok(
         {
             "sessionId": session_key,
-            "totalTurns": stats["total"],
-            "correctedTurns": stats["corrected"],
             "accuracy": stats["score"],
         }
     )
@@ -592,15 +558,46 @@ async def get_accuracy(sessionId: Optional[str] = Query(default=None)):
 @app.get("/api/conversation/history")
 async def get_conversation_history(sessionId: Optional[str] = Query(default=None)):
     """
-    sessionId별 전체 대화 히스토리를 반환.
-    메인 백엔드에서 '세션 종료' 시 이 엔드포인트를 호출해서
-    해당 세션 동안의 전체 대화 로그를 가져갈 수 있다.
+    sessionId별 전체 대화 히스토리를 반환하고,
+    그 즉시 해당 세션의 상태(CHAT_HISTORY, CURRENT_TOPIC, 정확도, 피드백)를 초기화한다.
+
+    - 메인 백엔드에서 '세션 종료' 시 이 엔드포인트를 호출하면
+      1) 전체 대화 로그를 받아서 저장하고
+      2) AI 서버 쪽 세션 상태는 자동으로 reset 된다.
+
+    변경 사항:
+      - 응답 바디에는 sessionId와 간단한 history만 포함한다.
+      - history 항목에는 user 발화와 AI 응답(reply_en)만 포함한다.
+        (corrected_en, feedback, accuracy 등은 응답에서 제외)
     """
     session_key = _session_key(sessionId)
-    history = CHAT_HISTORY.get(session_key, [])
-    return ok(
+
+    raw_history = CHAT_HISTORY.get(session_key, [])
+
+    # user + reply_en만 노출
+    history_simple: List[Dict[str, str]] = []
+    for turn in raw_history:
+        if not isinstance(turn, dict):
+            continue
+        history_simple.append(
+            {
+                "user": turn.get("user", ""),
+                "reply_en": turn.get("reply_en", ""),
+            }
+        )
+
+    response_body = ok(
         {
             "sessionId": session_key,
-            "history": history,
+            "history": history_simple,
         }
     )
+
+    # 세션 상태 초기화 (응답에는 안 나오지만 메모리 정리)
+    CHAT_HISTORY.pop(session_key, None)
+    CURRENT_TOPIC.pop(session_key, None)
+    ACCURACY_TOTAL_TURNS.pop(session_key, None)
+    ACCURACY_NEEDS_CORRECTION.pop(session_key, None)
+    FEEDBACK_HISTORY.pop(session_key, None)
+
+    return response_body
