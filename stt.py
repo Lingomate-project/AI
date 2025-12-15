@@ -1,4 +1,3 @@
-# stt.py
 from __future__ import annotations
 
 import os
@@ -8,176 +7,207 @@ from typing import List, Tuple
 import logging
 import numpy as np
 from google.cloud import speech_v2 as speech
-from google.oauth2 import service_account
-import google.auth
 from google.api_core.client_options import ClientOptions
+
+from gcp_auth import get_credentials, GCPAuthError
 
 logger = logging.getLogger(__name__)
 
-# =========================
-# 고정 정책 & 튜닝 값
-# =========================
-STT_PRIMARY: str = "en-US"              # 인식 언어(영어 고정)
-SAMPLE_RATE: int = 48000                # 입력 PCM 샘플레이트(Hz)
-N_BEST: int = 8                         # 세그먼트별 대안 후보 개수
+STT_PRIMARY: str = "en-US"
+SAMPLE_RATE: int = 16000          # 16kHz
+N_BEST: int = 8
 
-RECOGNIZER_LOCATION: str = "asia-northeast1"
-RECOGNIZER_ID: str = os.getenv("STT_RECOGNIZER_ID", "_")
+# 위치/프로젝트/리코그나이저 설정
+RECOGNIZER_LOCATION: str = os.getenv("STT_LOCATION", "asia-northeast1")
 
-# 사용할 STT 모델 ID
-STT_MODEL: str = "chirp_3"
+STT_MODEL: str = os.getenv("STT_MODEL", "chirp_3")
 
-# 가벼운 전처리
-PREEMPHASIS: float = 0.97               # 프리엠퍼시스 계수
-TARGET_RMS_DBFS: float | None = -18     # 대략적 RMS 타깃(dBFS)
+RECOGNIZER_ID: str = "_"
 
-# Windows 에서 sounddevice 사용 시 이벤트 루프 정책 설정
-if sys.platform.startswith("win"):
-    import asyncio as _asyncio
-    _asyncio.set_event_loop_policy(_asyncio.WindowsSelectorEventLoopPolicy())
+# ====== (전처리 관련, 지금은 사용 안 함) ======
+PREEMPHASIS: float = 0.97
+TARGET_RMS_DBFS: float | None = -18
 
 
-# =========================
-# 유틸리티
-# =========================
-def log(title: str) -> None:
-    """콘솔에 구분선과 함께 타이틀 로그 출력."""
-    line = "=" * len(title)
-    logger.info("\n%s\n%s\n%s", line, title, line)
+class STTError(Exception):
+    """STT 처리 단계 에러 (어디서 터졌는지 알려주는용)."""
+
+    def __init__(self, stage: str, detail: str):
+        self.stage = stage      # 예: "auth", "client", "input", "preprocess", "request", "api", "parse"
+        self.detail = detail
+        super().__init__(f"[{stage}] {detail}")
 
 
-def _build_recognizer_path(project_id: str) -> str:
-    return f"projects/{project_id}/locations/{RECOGNIZER_LOCATION}/recognizers/{RECOGNIZER_ID}"
+def _get_speech_client() -> speech.SpeechClient:
+    """SpeechClient 생성 (에러 시 STTError로 감싸서 던짐)."""
+    try:
+        creds = get_credentials()
+    except GCPAuthError as e:
+        logger.error("STT auth error: %s", e, exc_info=True)
+        raise STTError(f"auth/{e.stage}", e.detail)
+
+    try:
+        # location에 따라 endpoint 결정
+        if RECOGNIZER_LOCATION == "global":
+            api_endpoint = "speech.googleapis.com"
+        else:
+            api_endpoint = f"{RECOGNIZER_LOCATION}-speech.googleapis.com"
+
+        logger.info("STT api_endpoint = %s", api_endpoint)
+
+        client_options = ClientOptions(api_endpoint=api_endpoint)
+        client = speech.SpeechClient(
+            credentials=creds,
+            client_options=client_options,
+        )
+    except Exception as e:
+        logger.error("STT client init failed: %s", e, exc_info=True)
+        raise STTError("client", f"SpeechClient 생성 실패: {e}")
+
+    return client
 
 
-def _load_speech_client() -> speech.SpeechClient:
-    cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-
-    client_options = None
-    location = RECOGNIZER_LOCATION
-    # global 이 아닌 경우 리전 엔드포인트로 접속
-    if location and location != "global":
-        client_options = ClientOptions(api_endpoint=f"{location}-speech.googleapis.com")
-
-    if cred_path and os.path.exists(cred_path):
-        creds = service_account.Credentials.from_service_account_file(cred_path)
-        logger.info("STT using explicit service account credentials")
-        return speech.SpeechClient(credentials=creds, client_options=client_options)
-
-    # ADC 사용
-    logger.info("STT using ADC (Application Default Credentials)")
-    return speech.SpeechClient(client_options=client_options)
+def _pre_emphasis(signal: np.ndarray, coef: float = PREEMPHASIS) -> np.ndarray:
+    if coef is None or coef == 0:
+        return signal
+    return np.append(signal[0], signal[1:] - coef * signal[:-1])
 
 
-def _project_id_from_adc() -> str:
-    """ADC에서 현재 GCP 프로젝트 ID를 해석. 실패 시 예외 발생."""
-    project_id = google.auth.default()[1]
-    if not project_id:
-        raise RuntimeError("ADC/자격증명에서 GCP 프로젝트 ID를 찾지 못했습니다.")
-    return project_id
+def _rms_dbfs(x: np.ndarray) -> float:
+    rms = np.sqrt(np.mean(np.square(x), axis=-1))
+    return 20 * np.log10(rms / 32768.0 + 1e-12)
 
 
-# =========================
-# 오디오 전처리
-# =========================
-def _preemphasis(x: np.ndarray, coeff: float) -> np.ndarray:
-    if not (0.0 < coeff < 1.0):
-        return x
-    y = np.empty_like(x, dtype=np.float32)
-    y[0] = x[0]
-    xf = x.astype(np.float32)
-    y[1:] = xf[1:] - coeff * xf[:-1]
-    y = np.clip(y, -32768, 32767).astype(np.int16)
-    return y
-
-
-def _rms_normalize(x: np.ndarray, target_dbfs: float | None) -> np.ndarray:
+def _gain_to_target_dbfs(x: np.ndarray, target_dbfs: float) -> np.ndarray:
     if target_dbfs is None:
         return x
-    xf = x.astype(np.float32)
-    rms = float(np.sqrt(np.mean(xf * xf) + 1e-9))
-    if rms <= 1e-6:
-        return x
-    cur_db = 20.0 * np.log10(rms / 32767.0 + 1e-12)
-    gain_db = max(-12.0, min(12.0, target_dbfs - cur_db))
-    g = 10 ** (gain_db / 20.0)
-    y = np.clip(xf * g, -32768, 32767).astype(np.int16)
-    return y
+
+    current = _rms_dbfs(x)
+    diff_db = target_dbfs - current
+    gain = 10 ** (diff_db / 20.0)
+    return x * gain
 
 
-def _preprocess_pcm(pcm: bytes) -> bytes:
-    if (PREEMPHASIS <= 0.0) and (TARGET_RMS_DBFS is None):
-        return pcm
-    x = np.frombuffer(pcm, dtype=np.int16)
-    if PREEMPHASIS > 0.0:
-        x = _preemphasis(x, PREEMPHASIS)
-    x = _rms_normalize(x, TARGET_RMS_DBFS)
-    return x.tobytes()
+async def stt_transcribe(
+    pcm_data: bytes,
+    sr: int = SAMPLE_RATE,
+    language_code: str = STT_PRIMARY,
+    n_best: int = N_BEST,
+) -> Tuple[str, List[str]]:
+    """
+    16bit mono PCM 바이트를 받아 STT 수행.
+    에러 발생 시 STTError(stage, detail)를 던진다.
 
+    반환:
+      - best_text: 가장 확률 높은 transcript
+      - nbest_texts: 대안 transcript 리스트
+    """
+    if not pcm_data:
+        raise STTError("input", "PCM 데이터가 비어 있습니다.")
 
-# =========================
-# v2 Recognize 구성 (Chirp 3)
-# =========================
+    # 1) numpy 변환
+    try:
+        audio_np = np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32)
+    except Exception as e:
+        raise STTError("input", f"PCM → numpy 변환 실패: {e}")
 
-def _build_recognize_config(sr: int) -> speech.RecognitionConfig:
-    decoding = speech.ExplicitDecodingConfig(
-        encoding=speech.ExplicitDecodingConfig.AudioEncoding.LINEAR16,
-        sample_rate_hertz=sr,
-        audio_channel_count=1,
-    )
-    features = speech.RecognitionFeatures(
-        enable_automatic_punctuation=True,
-        max_alternatives=N_BEST
-    )
-    return speech.RecognitionConfig(
-        explicit_decoding_config=decoding,
-        language_codes=[STT_PRIMARY],
-        model=STT_MODEL,
-        features=features,
+    logger.info(
+        "STT input pcm: samples=%d, min=%.1f, max=%.1f, mean=%.3f",
+        audio_np.shape[0],
+        float(audio_np.min()) if audio_np.size > 0 else 0.0,
+        float(audio_np.max()) if audio_np.size > 0 else 0.0,
+        float(audio_np.mean()) if audio_np.size > 0 else 0.0,
     )
 
+    # 2) 전처리 없이 원본 그대로 사용
+    processed_bytes = pcm_data
 
-async def stt_transcribe(pcm: bytes, sr: int = SAMPLE_RATE) -> Tuple[str, List[List[str]]]:
-    log(f"STT (v2 Recognize + {STT_MODEL}) 실행 — language={STT_PRIMARY}, location={RECOGNIZER_LOCATION}")
+    # 3) 클라이언트 & recognizer 경로
+    client = _get_speech_client()
 
-    def _do_recognize() -> Tuple[str, List[List[str]]]:
-        try:
-            client = _load_speech_client()
-            project_id = _project_id_from_adc()
-            recognizer = _build_recognizer_path(project_id)
-            logger.info("Using recognizer: %s", recognizer)
+    project_id = os.getenv("GCP_PROJECT_ID", "_")
+    recognizer = f"projects/{project_id}/locations/{RECOGNIZER_LOCATION}/recognizers/{RECOGNIZER_ID}"
+    logger.info("STT recognizer path = %s", recognizer)
+    logger.info("STT model = %s, language = %s, sr = %d", STT_MODEL, language_code, sr)
 
-            # 1) 전처리 적용
-            pcm_clean = _preprocess_pcm(pcm)
+    # 4) explicit_decoding_config 로 RAW PCM 형식 명시
+    try:
+        config = speech.RecognitionConfig(
+            explicit_decoding_config=speech.ExplicitDecodingConfig(
+                encoding=speech.ExplicitDecodingConfig.AudioEncoding.LINEAR16,
+                sample_rate_hertz=sr,
+                audio_channel_count=1,
+            ),
+            language_codes=[language_code],
+            model=STT_MODEL,  
+            features=speech.RecognitionFeatures(
+                enable_word_time_offsets=False,
+                enable_automatic_punctuation=True,
+            ),
+        )
 
-            # 2) Recognize 요청 구성 & 호출
-            config = _build_recognize_config(sr)
-            request = speech.RecognizeRequest(
-                recognizer=recognizer,
-                config=config,
-                content=pcm_clean,  # v2는 별도 RecognitionAudio 없이 content에 직접 바이트 전달
-            )
-            response = client.recognize(request=request)
+        request = speech.RecognizeRequest(
+            recognizer=recognizer,
+            config=config,
+            content=processed_bytes,
+        )
+    except Exception as e:
+        raise STTError("request", f"RecognizeRequest 구성 실패: {e}")
 
-            # 3) 결과 파싱
-            alt_segments: List[List[str]] = []
-            top_pieces: List[str] = []
-            for result in response.results:
-                if not result.alternatives:
-                    continue
-                alts = [a.transcript.strip() for a in result.alternatives if a.transcript]
-                if not alts:
-                    continue
-                alt_segments.append(alts)
-                top_pieces.append(alts[0])
+    logger.info(
+        "Calling STT recognize: recognizer=%s, lang=%s, n_best=%d, sr=%d",
+        recognizer,
+        language_code,
+        n_best,
+        sr,
+    )
 
-            transcript = " ".join(p for p in top_pieces if p).strip()
-            logger.info("STT transcript: %s", transcript)
-            return transcript, alt_segments
-        except Exception as e:
-            logger.error("STT recognize error: %s", e, exc_info=True)
-            # 실패 시 빈 결과 반환
-            return "", []
+    # 5) API 호출
+    try:
+        response = client.recognize(request)
+    except Exception as e:
+        logger.error("STT recognize() API 호출 실패: %s", e, exc_info=True)
+        raise STTError("api", f"STT API 호출 실패: {e}")
 
-    import asyncio
-    return await asyncio.to_thread(_do_recognize)
+    # 6) 응답 파싱 + 디버그용 전체 로그
+    try:
+        nbest_texts: List[str] = []
+        debug_results = []
+
+        for r_idx, result in enumerate(response.results):
+            for a_idx, alt in enumerate(result.alternatives[:n_best]):
+                debug_results.append(
+                    {
+                        "result_index": r_idx,
+                        "alt_index": a_idx,
+                        "transcript": alt.transcript,
+                        "confidence": alt.confidence,
+                    }
+                )
+                # 공백만 있는 transcript 는 제외
+                if alt.transcript and alt.transcript.strip():
+                    nbest_texts.append(alt.transcript.strip())
+
+        logger.info("STT raw alternatives: %s", debug_results)
+
+    except Exception as e:
+        raise STTError("parse", f"STT 응답 파싱 실패: {e}")
+
+    if not nbest_texts:
+        logger.warning("STT empty transcript. Raw results: %s", debug_results)
+        raise STTError("parse", "STT 결과가 비어 있습니다.")
+
+    best_text = nbest_texts[0]
+    return best_text, nbest_texts
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        stream=sys.stdout,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+    logger.info("SAMPLE_RATE = %d", SAMPLE_RATE)
+    logger.info("GCP_PROJECT_ID = %s", os.getenv("GCP_PROJECT_ID"))
+    logger.info("STT_LOCATION = %s", RECOGNIZER_LOCATION)
+    logger.info("STT_MODEL = %s", STT_MODEL)
