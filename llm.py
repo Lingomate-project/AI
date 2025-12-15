@@ -1,4 +1,3 @@
-# llm.py
 """
 Gemini 기반 영어 튜터 로직 (대화 맥락 + 주제 관리)
 
@@ -181,14 +180,6 @@ FEEDBACK_SYSTEM_PROMPT = (
 def generate_feedback(text: str) -> Dict[str, Any]:
     """
     /api/ai/feedback 에서 사용하는 LLM 래퍼 (버튼 기반 문장 교정용).
-
-    입력: 사용자가 실제로 말한 영어 문장(또는 구)
-    반환 형태:
-      {
-        "corrected_en": str,       # 교정된 자연스러운 영어 문장
-        "reason_ko": str,          # 왜 그렇게 수정했는지 한국어 설명
-        "needs_correction": bool   # 교정이 필요한지 여부
-      }
     """
     data = call_gemini_json(
         system_prompt=FEEDBACK_SYSTEM_PROMPT,
@@ -296,22 +287,6 @@ def generate_session_review_vocab(
     chat_history: List[Dict[str, str]],
     max_items: int = 5,
 ) -> Dict[str, Any]:
-    """
-    한 세션의 전체 대화 히스토리를 입력받아
-    '어려운 단어/숙어' 목록을 뽑아주는 LLM 래퍼.
-
-    반환 예:
-      {
-        "items": [
-          {
-            "term": "come up with",
-            "meaning_ko": "떠올리다, 생각해내다",
-            "examples": ["...", "..."]
-          },
-          ...
-        ]
-      }
-    """
     payload = {
         "chat_history": chat_history,
         "max_items": max_items,
@@ -332,7 +307,6 @@ def generate_session_review_vocab(
     if not isinstance(items, list):
         return {"items": []}
 
-    # 최소한의 정리
     cleaned_items = []
     for item in items:
         try:
